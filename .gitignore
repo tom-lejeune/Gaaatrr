@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+*.log
+*.amxd.bak
+# Freeze output and Max auto-saves stay local; the generated device/ files ARE committed on purpose
+*.maxpat.bak

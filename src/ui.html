@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gaaatrr</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #0b0b10;
+    user-select: none; -webkit-user-select: none;
+    font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  #fit { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #stage { position: relative; width: 820px; height: 169px; flex: none; transform-origin: center center; }
+  canvas { position: absolute; left: 0; top: 0; width: 820px; height: 169px; touch-action: none; cursor: default; }
+  #bar { position: absolute; left: 118px; top: 5px; height: 22px; display: flex; gap: 3px; align-items: center; }
+  #bar button, #bar .pill {
+    height: 20px; box-sizing: border-box; padding: 0 5px; border-radius: 6px;
+    border: 1px solid #2c2c40; background: #14141e; color: #bcbcd0;
+    font-family: inherit; font-weight: 700; font-size: 8.5px; line-height: 18px; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap;
+  }
+  #bar button { cursor: pointer; transition: background .12s, border-color .12s, color .12s, box-shadow .12s; }
+  #bar button:hover { background: #1d1d2c; border-color: #4a4a6c; color: #fff; }
+  #bar button:active { background: #262640; }
+  #bar button.on { color: #0b0b10; background: #00c6ae; border-color: #00c6ae; box-shadow: 0 0 10px #00c6ae88; }
+  #bar button.dice { color: #ff4d8d; border-color: #5b2540; }
+  #bar button.dice:hover { color: #fff; background: #ff4d8d; border-color: #ff4d8d; box-shadow: 0 0 12px #ff4d8d99; }
+  #bar .pill { width: 112px; text-align: center; color: #ffd600; border-color: #4b4220; letter-spacing: .05em; overflow: hidden; text-overflow: ellipsis; }
+  #bar .sep { width: 3px; }
+</style>
+</head>
+<body>
+<div id="fit"><div id="stage"><canvas id="c"></canvas><div id="bar"></div></div></div>
+
+<script>/*__CORE__*/</script>
+<script>
+(function () {
+  'use strict';
+  var C = GaaatrrCore;
+  var W = 820, H = 169;
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var stage = document.getElementById('stage');
+  var bar = document.getElementById('bar');
+  var max = window.max || null; // jweb injects window.max; absent in a normal browser (demo mode)
+
+  // ---- layout ------------------------------------------------------------
+  var BAR = { x: 10, y: 40, w: 22, gap: 2.4, h: 90 };
+  BAR.total = C.MAX_STEPS * BAR.w + (C.MAX_STEPS - 1) * BAR.gap;
+  var KNOB = { x: 412, y: 34, cw: 57.5, ch: 66, cols: 7, r: 14 };
+  var KNOB_HUE = [330, 20, 48, 90, 170, 200, 260, 290, 330, 20, 48, 90, 170, 200];
+
+  // ---- state -------------------------------------------------------------
+  var S = C.defaults();
+  var table = null;
+  var needTable = true;
+  var undoStack = [];
+  var presetIndex = -1;
+  var presetModified = false;
+  var euclidHits = 4;
+  var eco = false;
+  var flashText = '', flashUntil = 0;
+  var hoverStep = -1, hoverKnob = -1;
+  var lastPhase = 0, lastPhaseAt = 0, live = false;
+  var demoBpm = 124;
+  var sparks = [];
+  var lastSlotKey = '';
+
+  function stepColor(i) { return 'hsl(' + ((330 + i * 22) % 360) + ' 95% 60%)'; }
+  function stepColorA(i, a) { return 'hsla(' + ((330 + i * 22) % 360) + ',95%,60%,' + a + ')'; }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  // ---- talking to Max ----------------------------------------------------
+  function send(pairs) {
+    if (!pairs.length) return;
+    if (max) max.outlet.apply(max, ['params'].concat(pairs));
+    else if (window.console && console.debug) console.debug('params', pairs.join(' '));
+  }
+
+  if (max) {
+    max.bindInlet('state', function () {
+      for (var i = 0; i + 1 < arguments.length; i += 2) C.setParam(S, String(arguments[i]), arguments[i + 1]);
+      needTable = true;
+    });
+    max.bindInlet('phase', function (p) {
+      lastPhase = Number(p) || 0;
+      lastPhaseAt = performance.now();
+      live = true;
+    });
+    max.outlet('ready');
+  }
+
+  // ---- editing helpers ---------------------------------------------------
+  function flash(text) { flashText = text; flashUntil = performance.now() + 1800; }
+
+  function pushUndo() {
+    undoStack.push(C.clone(S));
+    if (undoStack.length > 40) undoStack.shift();
+  }
+
+  function applyDiff(next) {
+    var pairs = [];
+    C.paramNames().forEach(function (n) {
+      var a = C.getParam(S, n), b = C.getParam(next, n);
+      if (a !== b) { pairs.push(n, b); C.setParam(S, n, b); }
+    });
+    if (pairs.length) { needTable = true; send(pairs); }
+    return pairs.length > 0;
+  }
+
+  function commit(next, label) {
+    var before = C.clone(S);
+    if (applyDiff(next)) { undoStack.push(before); if (undoStack.length > 40) undoStack.shift(); presetModified = true; }
+    if (label) flash(label);
+  }
+
+  function setStep(i, v) {
+    if (S.steps[i] === v) return;
+    S.steps[i] = v; needTable = true; presetModified = true;
+    send(['s' + (i + 1), v]);
+  }
+
+  function setGlobal(name, v) {
+    if (!C.setParam(S, name, v)) return;
+    needTable = true; presetModified = true;
+    send([name, S[name]]);
+  }
+
+  function copyWith(patch) { var n = C.clone(S); Object.keys(patch).forEach(function (k) { n[k] = patch[k]; }); return n; }
+
+  // ---- header buttons ----------------------------------------------------
+  var presetPill;
+  function addButton(label, title, fn, cls) {
+    var b = document.createElement('button');
+    b.textContent = label; b.title = title; if (cls) b.className = cls;
+    b.addEventListener('click', fn);
+    bar.appendChild(b);
+    return b;
+  }
+  function sep() { var s = document.createElement('span'); s.className = 'sep'; bar.appendChild(s); }
+
+  function loadPreset(i) {
+    presetIndex = ((i % C.PRESETS.length) + C.PRESETS.length) % C.PRESETS.length;
+    commit(C.presetParams(presetIndex, S), C.PRESETS[presetIndex].name);
+    presetModified = false;
+    refreshPill();
+  }
+  function refreshPill() {
+    presetPill.textContent = presetIndex < 0 ? 'CUSTOM' : C.PRESETS[presetIndex].name + (presetModified ? ' *' : '');
+  }
+
+  addButton('‹', 'Previous preset', function () { loadPreset(presetIndex < 0 ? C.PRESETS.length - 1 : presetIndex - 1); });
+  presetPill = document.createElement('div'); presetPill.className = 'pill'; bar.appendChild(presetPill);
+  addButton('›', 'Next preset', function () { loadPreset(presetIndex + 1); });
+  sep();
+  addButton('DICE', 'Roll a new random pattern and seed', function () {
+    var r = C.rng((Math.random() * 4294967296) >>> 0);
+    var seed = Math.floor(r() * 10000);
+    commit(copyWith({ steps: C.randomSteps(S.steps, S.len, 0.35 + r() * 0.4, r, true), seed: seed }), 'DICE · seed ' + seed);
+  }, 'dice');
+  addButton('EUCLID', 'Spread hits evenly; each click adds one hit', function () {
+    euclidHits = euclidHits % S.len + 1;
+    commit(copyWith({ steps: C.euclid(S.len, euclidHits, 0).concat(S.steps.slice(S.len)).slice(0, C.MAX_STEPS) }),
+      'EUCLID ' + euclidHits + '/' + S.len);
+  });
+  addButton('◀', 'Rotate pattern earlier', function () { commit(copyWith({ steps: C.rotateSteps(S.steps, S.len, -1) }), 'ROTATE ◀'); });
+  addButton('▶', 'Rotate pattern later', function () { commit(copyWith({ steps: C.rotateSteps(S.steps, S.len, 1) }), 'ROTATE ▶'); });
+  addButton('INV', 'Invert: swap on and off', function () { commit(copyWith({ steps: C.invertSteps(S.steps, S.len) }), 'INVERT'); });
+  addButton('MIR', 'Mirror the pattern', function () { commit(copyWith({ steps: C.mirrorSteps(S.steps, S.len) }), 'MIRROR'); });
+  addButton('ALL', 'All steps on', function () { commit(copyWith({ steps: C.fillSteps(S.steps, S.len, 100) }), 'ALL ON'); });
+  addButton('CLR', 'All steps off', function () { commit(copyWith({ steps: C.fillSteps(S.steps, S.len, 0) }), 'CLEARED'); });
+  sep();
+  addButton('UNDO', 'Undo the last change', function () {
+    var prev = undoStack.pop();
+    if (!prev) { flash('NOTHING TO UNDO'); return; }
+    applyDiff(prev); flash('UNDO');
+  });
+  var ecoBtn = addButton('ECO', 'Lighter visuals: fewer frames, no glow', function () {
+    eco = !eco; ecoBtn.classList.toggle('on', eco); flash(eco ? 'ECO VISUALS ON' : 'ECO VISUALS OFF');
+  });
+  refreshPill();
+
+  // ---- pointer interaction -----------------------------------------------
+  function toLocal(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+  }
+  function hitStep(p) {
+    if (p.y < BAR.y - 2 || p.y > BAR.y + BAR.h + 14) return -1;
+    var i = Math.floor((p.x - BAR.x + BAR.gap / 2) / (BAR.w + BAR.gap));
+    return i >= 0 && i < C.MAX_STEPS ? i : -1;
+  }
+  function knobCell(i) {
+    var col = i % KNOB.cols, row = Math.floor(i / KNOB.cols);
+    var x = KNOB.x + col * KNOB.cw, y = KNOB.y + row * KNOB.ch;
+    return { x: x, y: y, cx: x + KNOB.cw / 2, cy: y + 30 };
+  }
+  function hitKnob(p) {
+    for (var i = 0; i < C.PARAM_DEFS.length; i++) {
+      var c = knobCell(i);
+      if (p.x >= c.x && p.x < c.x + KNOB.cw && p.y >= c.y && p.y < c.y + KNOB.ch) return i;
+    }
+    return -1;
+  }
+
+  var drag = null;
+  function levelFromY(y) {
+    var v = Math.round((BAR.y + BAR.h - y) / BAR.h * 100);
+    return clamp(v < 6 ? 0 : v, 0, 100);
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = toLocal(e);
+    var si = hitStep(p);
+    if (si >= 0) {
+      drag = { type: 'step', first: si, startX: p.x, startY: p.y, mode: null, paint: S.steps[si] > 0 ? 0 : 100, pushed: false };
+    } else {
+      var k = hitKnob(p);
+      if (k < 0) return;
+      var def = C.PARAM_DEFS[k];
+      drag = { type: 'knob', k: k, def: def, startY: p.y, startVal: S[def.name], pushed: false };
+    }
+    canvas.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    var p = toLocal(e);
+    if (!drag) {
+      hoverStep = hitStep(p);
+      hoverKnob = hoverStep >= 0 ? -1 : hitKnob(p);
+      canvas.style.cursor = hoverStep >= 0 ? 'pointer' : hoverKnob >= 0 ? 'ns-resize' : 'default';
+      return;
+    }
+    if (drag.type === 'step') {
+      var cur = hitStep(p);
+      if (!drag.mode) {
+        if (Math.abs(p.y - drag.startY) > 5) drag.mode = 'level';
+        else if (cur >= 0 && cur !== drag.first) drag.mode = 'paint';
+        if (drag.mode && !drag.pushed) { pushUndo(); drag.pushed = true; }
+        if (drag.mode === 'paint') setStep(drag.first, drag.paint);
+      }
+      if (drag.mode === 'level') setStep(drag.first, levelFromY(p.y));
+      else if (drag.mode === 'paint' && cur >= 0) setStep(cur, drag.paint);
+    } else {
+      var d = drag.def, range = d.max - d.min;
+      var full = range <= 12 ? range * 14 : 160;
+      var raw = drag.startVal + (drag.startY - p.y) / full * range / (e.shiftKey ? 5 : 1);
+      var v = clamp(Math.round(raw), d.min, d.max);
+      if (v !== S[d.name]) {
+        if (!drag.pushed) { pushUndo(); drag.pushed = true; }
+        setGlobal(d.name, v);
+      }
+    }
+  });
+
+  function endDrag(e) {
+    if (!drag) return;
+    if (drag.type === 'step' && !drag.mode) {
+      pushUndo(); setStep(drag.first, drag.paint);
+    }
+    drag = null;
+    refreshPill();
+    try { canvas.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+  canvas.addEventListener('pointerleave', function () { if (!drag) { hoverStep = -1; hoverKnob = -1; } });
+
+  canvas.addEventListener('dblclick', function (e) {
+    var p = toLocal(e), k = hitKnob(p);
+    if (k >= 0) { pushUndo(); setGlobal(C.PARAM_DEFS[k].name, C.PARAM_DEFS[k].def); refreshPill(); flash(C.PARAM_DEFS[k].label + ' RESET'); }
+  });
+
+  canvas.addEventListener('wheel', function (e) {
+    var p = toLocal(e), si = hitStep(p), k = si >= 0 ? -1 : hitKnob(p);
+    var dir = e.deltaY < 0 ? 1 : -1;
+    if (si >= 0) {
+      e.preventDefault(); pushUndo();
+      setStep(si, clamp(S.steps[si] + dir * (e.shiftKey ? 2 : 10), 0, 100));
+    } else if (k >= 0) {
+      e.preventDefault();
+      var d = C.PARAM_DEFS[k];
+      var step = e.shiftKey ? 1 : Math.max(1, Math.round((d.max - d.min) / 50));
+      pushUndo(); setGlobal(d.name, clamp(S[d.name] + dir * step, d.min, d.max));
+    }
+    refreshPill();
+  }, { passive: false });
+
+  // ---- drawing -----------------------------------------------------------
+  function rr(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // demo mode only: open ui.html?phase=0.3 to freeze the playhead (used for screenshots)
+  var frozenPhase = max ? null : new URLSearchParams(window.location.search).get('phase');
+
+  function getPhase(now) {
+    if (frozenPhase !== null) return { phase: Number(frozenPhase) || 0, playing: true };
+    if (max) {
+      if (live && now - lastPhaseAt < 600) return { phase: lastPhase, playing: true };
+      return { phase: lastPhase, playing: false };
+    }
+    var beats = (now / 1000) * demoBpm / 60;
+    return { phase: (beats / C.tableBeats(S)) % 1, playing: true };
+  }
+
+  function drawBackground(now, env, playing) {
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#0d0d14'); g.addColorStop(1, '#14111d');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    if (!eco) {
+      var hue = (now / 40) % 360;
+      var rg = ctx.createRadialGradient(BAR.x + BAR.total / 2, BAR.y + BAR.h, 10, BAR.x + BAR.total / 2, BAR.y + BAR.h, 300);
+      var a = playing ? 0.05 + 0.2 * env * (S.depth / 100) : 0.05;
+      rg.addColorStop(0, 'hsla(' + hue + ',90%,55%,' + a + ')');
+      rg.addColorStop(1, 'hsla(' + hue + ',90%,55%,0)');
+      ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    ctx.fillRect(0, 31, W, 1);
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    ctx.fillRect(404, 38, 1, 120);
+  }
+
+  function drawLogo(now) {
+    ctx.save();
+    ctx.font = 'italic 900 18px "Segoe UI", Helvetica, Arial, sans-serif';
+    var g = ctx.createLinearGradient(10, 0, 118, 0);
+    var h = eco ? 330 : (now / 30) % 360;
+    g.addColorStop(0, 'hsl(' + h + ',95%,62%)');
+    g.addColorStop(1, 'hsl(' + (h + 70) % 360 + ',95%,62%)');
+    ctx.fillStyle = g;
+    if (!eco) { ctx.shadowColor = 'hsla(' + h + ',95%,60%,.55)'; ctx.shadowBlur = 10; }
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('GAAATRR', 10, 21);
+    ctx.restore();
+    ctx.fillStyle = '#6a6a85';
+    ctx.font = '700 6.5px "Segoe UI", Helvetica, Arial, sans-serif';
+    ctx.fillText('OPEN · CLOSE · REPEAT', 11, 29);
+  }
+
+  function drawBars(now, loc, playing, env) {
+    ctx.textAlign = 'center';
+    for (var i = 0; i < C.MAX_STEPS; i++) {
+      var x = BAR.x + i * (BAR.w + BAR.gap);
+      var active = i < S.len;
+      var level = S.steps[i] / 100;
+      var current = playing && loc && loc.step === i && active;
+      ctx.globalAlpha = active ? 1 : 0.32;
+      ctx.fillStyle = i === hoverStep ? '#1d1d2b' : '#15151f';
+      rr(x, BAR.y, BAR.w, BAR.h, 4); ctx.fill();
+      if (level > 0) {
+        var lh = Math.max(4, level * BAR.h);
+        var y = BAR.y + BAR.h - lh;
+        var g = ctx.createLinearGradient(0, y, 0, BAR.y + BAR.h);
+        g.addColorStop(0, stepColor(i));
+        g.addColorStop(1, stepColorA(i, 0.45));
+        ctx.fillStyle = g;
+        if (current && !eco) { ctx.shadowColor = stepColor(i); ctx.shadowBlur = 8 + 14 * env; }
+        rr(x, y, BAR.w, lh, 4); ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'rgba(255,255,255,' + (current ? 0.35 : 0.12) + ')';
+        rr(x + 2, y + 2, BAR.w - 4, Math.min(6, lh - 3), 2); ctx.fill();
+      }
+      if (current) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.2;
+        rr(x + 0.5, BAR.y + 0.5, BAR.w - 1, BAR.h - 1, 4); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = active ? (i % 4 === 0 ? '#c9c9dd' : '#6a6a85') : '#3a3a4a';
+      ctx.font = (i % 4 === 0 ? '800 ' : '600 ') + '8px "Segoe UI", Helvetica, Arial, sans-serif';
+      ctx.fillText(String(i + 1), x + BAR.w / 2, BAR.y + BAR.h + 11);
+    }
+    ctx.textAlign = 'left';
+    // end-of-pattern marker
+    if (S.len < C.MAX_STEPS) {
+      var ex = BAR.x + S.len * (BAR.w + BAR.gap) - BAR.gap / 2;
+      ctx.fillStyle = 'rgba(255,214,0,0.55)'; ctx.fillRect(ex - 0.5, BAR.y - 3, 1, BAR.h + 6);
+    }
+  }
+
+  function drawScope(now, playing, phase, env) {
+    if (!table) return;
+    var cyc = Math.min(C.VARIATION_CYCLES - 1, Math.floor(phase * C.VARIATION_CYCLES));
+    var base = cyc * C.TABLE_CYCLE;
+    var bottom = BAR.y + BAR.h;
+    ctx.beginPath();
+    for (var px = 0; px <= BAR.total; px += 2) {
+      var idx = base + Math.min(C.TABLE_CYCLE - 1, Math.floor(px / BAR.total * C.TABLE_CYCLE));
+      var y = bottom - table[idx] * BAR.h;
+      if (px === 0) ctx.moveTo(BAR.x + px, y); else ctx.lineTo(BAR.x + px, y);
+    }
+    ctx.save();
+    ctx.lineJoin = 'round';
+    if (!eco) { ctx.shadowColor = 'rgba(255,255,255,.7)'; ctx.shadowBlur = 6; }
+    ctx.strokeStyle = 'rgba(255,255,255,0.88)'; ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+    // playhead
+    if (playing) {
+      var inCycle = phase * C.VARIATION_CYCLES - cyc;
+      var hx = BAR.x + inCycle * BAR.total;
+      ctx.save();
+      if (!eco) { ctx.shadowColor = '#fff'; ctx.shadowBlur = 8; }
+      ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.fillRect(hx - 0.75, BAR.y - 4, 1.5, BAR.h + 8);
+      ctx.restore();
+      var ey = bottom - env * BAR.h;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(hx, ey, 2.6, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function spawnSparks(loc) {
+    var i = loc.step, level = S.steps[i] / 100;
+    if (level <= 0 || eco) return;
+    var x = BAR.x + i * (BAR.w + BAR.gap) + BAR.w / 2;
+    var y = BAR.y + BAR.h - level * BAR.h;
+    for (var k = 0; k < 7; k++) {
+      sparks.push({ x: x + (Math.random() - 0.5) * BAR.w, y: y, vx: (Math.random() - 0.5) * 1.2, vy: -(0.6 + Math.random() * 1.8), life: 1, hue: (330 + i * 22) % 360 });
+    }
+    if (sparks.length > 80) sparks.splice(0, sparks.length - 80);
+  }
+
+  function drawSparks() {
+    for (var i = sparks.length - 1; i >= 0; i--) {
+      var s = sparks[i];
+      s.x += s.vx; s.y += s.vy; s.vy += 0.04; s.life -= 0.035;
+      if (s.life <= 0) { sparks.splice(i, 1); continue; }
+      ctx.fillStyle = 'hsla(' + s.hue + ',95%,65%,' + s.life + ')';
+      ctx.fillRect(s.x - 1, s.y - 1, 2, 2);
+    }
+  }
+
+  function drawKnob(i, now) {
+    var d = C.PARAM_DEFS[i], c = knobCell(i), v = S[d.name];
+    var t = (v - d.min) / (d.max - d.min);
+    var hue = KNOB_HUE[i], col = 'hsl(' + hue + ',95%,60%)';
+    var a0 = Math.PI * 0.75, a1 = Math.PI * 2.25;
+    var hot = i === hoverKnob || (drag && drag.type === 'knob' && drag.k === i);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = hot ? '#fff' : '#8a8aa5';
+    ctx.font = '800 7.5px "Segoe UI", Helvetica, Arial, sans-serif';
+    ctx.fillText(d.label, c.cx, c.y + 9);
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = '#22222f';
+    ctx.beginPath(); ctx.arc(c.cx, c.cy, KNOB.r, a0, a1); ctx.stroke();
+    var from = d.min < 0 ? (a0 + a1) / 2 : a0;
+    var to = a0 + t * (a1 - a0);
+    if (Math.abs(to - from) > 0.001) {
+      ctx.save();
+      if (hot && !eco) { ctx.shadowColor = col; ctx.shadowBlur = 10; }
+      ctx.strokeStyle = col;
+      ctx.beginPath(); ctx.arc(c.cx, c.cy, KNOB.r, Math.min(from, to), Math.max(from, to)); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.fillStyle = hot ? '#fff' : '#d9d9ea';
+    ctx.beginPath();
+    ctx.arc(c.cx + Math.cos(to) * (KNOB.r - 7), c.cy + Math.sin(to) * (KNOB.r - 7), 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = hot ? '#fff' : '#c4c4d8';
+    ctx.font = '700 9px "Segoe UI", Helvetica, Arial, sans-serif';
+    ctx.fillText(C.formatValue(d.name, v), c.cx, c.y + 58);
+    ctx.textAlign = 'left';
+  }
+
+  function drawStatus(now) {
+    ctx.font = '700 8px "Segoe UI", Helvetica, Arial, sans-serif';
+    var text = '', color = '#6a6a85';
+    if (now < flashUntil) { text = flashText; color = '#ffd600'; }
+    else if (hoverStep >= 0) { text = 'STEP ' + (hoverStep + 1) + ' · ' + (S.steps[hoverStep] > 0 ? S.steps[hoverStep] + '%' : 'OFF'); color = '#c4c4d8'; }
+    else if (hoverKnob >= 0) { text = C.PARAM_DEFS[hoverKnob].label + ' · ' + C.formatValue(C.PARAM_DEFS[hoverKnob].name, S[C.PARAM_DEFS[hoverKnob].name]) + ' · DOUBLE-CLICK TO RESET'; color = '#c4c4d8'; }
+    else if (!max) { text = 'DEMO MODE · OPEN IN LIVE FOR THE REAL THING'; }
+    ctx.fillStyle = color;
+    ctx.fillText(text, BAR.x, H - 4);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#4a4a62';
+    ctx.fillText(C.RATES[S.rate].name + ' × ' + S.len + ' · ' + (S.direction === 0 ? 'SEED ' + S.seed : C.DIRECTIONS[S.direction] + ' · SEED ' + S.seed), BAR.x + BAR.total, H - 4);
+    ctx.textAlign = 'left';
+  }
+
+  // ---- main loop ---------------------------------------------------------
+  var lastFrame = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (eco && now - lastFrame < 50) return;
+    lastFrame = now;
+    if (needTable) { table = C.buildTables(S).L; needTable = false; }
+
+    var ph = getPhase(now);
+    var env = table ? C.tableAt(table, ph.phase) : 0;
+    var loc = C.locate(S, ph.phase);
+    if (ph.playing) {
+      var key = loc.cycle + ':' + loc.slot;
+      if (key !== lastSlotKey) { lastSlotKey = key; spawnSparks(loc); }
+    }
+
+    ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+    drawBackground(now, env, ph.playing);
+    drawLogo(now);
+    drawBars(now, loc, ph.playing, env);
+    drawScope(now, ph.playing, ph.phase, env);
+    if (!eco) drawSparks();
+    for (var i = 0; i < C.PARAM_DEFS.length; i++) drawKnob(i, now);
+    drawStatus(now);
+  }
+
+  // ---- sizing: keep the 820x169 design crisp at any jweb size -------------
+  var renderScale = 1;
+  function resize() {
+    var fit = Math.min(window.innerWidth / W, window.innerHeight / H) || 1;
+    stage.style.transform = 'scale(' + fit + ')';
+    renderScale = Math.max(1, fit * (window.devicePixelRatio || 1));
+    canvas.width = Math.round(W * renderScale);
+    canvas.height = Math.round(H * renderScale);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+
+  // handy for tests and for poking around in a browser console
+  window.__gaaatrr = {
+    state: function () { return C.clone(S); },
+    undoDepth: function () { return undoStack.length; },
+  };
+})();
+</script>
+</body>
+</html>

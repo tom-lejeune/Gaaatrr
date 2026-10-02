@@ -1,0 +1,15 @@
+{
+  "name": "gaaatrr",
+  "version": "0.1.0",
+  "description": "A free trance-gate style rhythmic gate for Ableton Live, built as a Max for Live audio effect.",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node --test \"test/*.test.js\"",
+    "screenshot": "node scripts/screenshot.js"
+  }
+}
